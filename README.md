@@ -34,14 +34,19 @@ npm run dev   # http://localhost:5173
 
 ## 部署
 
+D1 数据库与 Worker 均已创建（`wrangler.jsonc` 已含真实 `database_id`），线上地址：<https://inkvault.yuandao4621.workers.dev>
+
+推送 main 分支会触发 GitHub Actions 自动部署（`.github/workflows/deploy.yml`：装依赖 → 应用 D1 迁移 → 构建部署）。需在仓库 Settings → Secrets and variables → Actions 配置两个 Secret：
+
+- `CLOUDFLARE_API_TOKEN`：Cloudflare 控制台 → My Profile → API Tokens 创建，用「Edit Cloudflare Workers」模板并附加 **D1:Edit** 权限
+- `CLOUDFLARE_ACCOUNT_ID`：`5d7d386e2f23335748e7bfa9e0db4f4b`
+
+手动部署（本地已 `wrangler login` 时）：
+
 ```bash
-npx wrangler login
-npx wrangler d1 create markdown-editor   # 把返回的 database_id 填入 wrangler.jsonc
 npx wrangler d1 migrations apply markdown-editor --remote
 npm run deploy
 ```
-
-打开 Workers 分配的域名，首次访问设置密码即可使用。
 
 ## 目录结构
 
