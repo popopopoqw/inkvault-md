@@ -10,6 +10,7 @@ const MAX_FAILS = 5;
 const LOCK_MS = 15 * 60 * 1000;
 const MAX_UPSERTS = 500;
 const MAX_CIPHER_CHARS = 3_000_000; // ~2.2MB 密文上限
+const MAX_VERSIONS_PER_DOC = 60; // 每文档保留的最多历史版数，超出删最老
 
 async function sha256Hex(input: string): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input));
@@ -270,10 +271,82 @@ api.post('/docs/sync', async (c) => {
   }
   for (const id of toDelete) {
     stmts.push(db.prepare('DELETE FROM docs WHERE id = ?').bind(id));
+    // 级联清理该文档的全部历史版本
+    stmts.push(db.prepare('DELETE FROM doc_versions WHERE doc_id = ?').bind(id));
   }
   if (stmts.length) await db.batch(stmts);
 
   return c.json({ docs: await fetchAllDocs(db) });
+});
+
+// ---- 文档历史版本（E2E：服务端只见密文与行数统计） ----
+
+// 存一版快照（客户端在内容被覆盖前上传旧内容的密文）
+api.post('/docs/:id/versions', async (c) => {
+  const denied = await requireSession(c);
+  if (denied) return denied;
+  const id = c.req.param('id');
+  if (id.length > 64) return c.json({ error: 'bad_id' }, 400);
+  const body = await c.req.json<{ cipher?: string; nonce?: string; added?: number; removed?: number }>().catch(() => null);
+  if (
+    !body?.cipher || !body.nonce ||
+    typeof body.added !== 'number' || typeof body.removed !== 'number' ||
+    body.cipher.length > MAX_CIPHER_CHARS || body.nonce.length > 64 ||
+    !Number.isInteger(body.added) || body.added < 0 || body.added > 1_000_000 ||
+    !Number.isInteger(body.removed) || body.removed < 0 || body.removed > 1_000_000
+  ) {
+    return c.json({ error: 'bad_request' }, 400);
+  }
+  const exists = await c.env.DB.prepare('SELECT 1 FROM docs WHERE id = ?').bind(id).first();
+  if (!exists) return c.json({ error: 'not_found' }, 404);
+
+  const next = await c.env.DB
+    .prepare('SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM doc_versions WHERE doc_id = ?')
+    .bind(id)
+    .first<{ next: number }>();
+  const seq = next?.next ?? 1;
+  await c.env.DB.batch([
+    c.env.DB
+      .prepare('INSERT INTO doc_versions (doc_id, seq, cipher, nonce, added, removed, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .bind(id, seq, body.cipher, body.nonce, body.added, body.removed, nowIso()),
+    // 超出保留上限时删掉最老的版本（与桌面版 60 版收敛一致）
+    c.env.DB
+      .prepare(
+        `DELETE FROM doc_versions WHERE doc_id = ? AND seq NOT IN (
+           SELECT seq FROM doc_versions WHERE doc_id = ? ORDER BY seq DESC LIMIT ?
+         )`
+      )
+      .bind(id, id, MAX_VERSIONS_PER_DOC),
+  ]);
+  return c.json({ seq });
+});
+
+// 版本列表（元数据倒序；内容需解密，客户端按需拉取单版）
+api.get('/docs/:id/versions', async (c) => {
+  const denied = await requireSession(c);
+  if (denied) return denied;
+  const id = c.req.param('id');
+  if (id.length > 64) return c.json({ error: 'bad_id' }, 400);
+  const { results } = await c.env.DB
+    .prepare('SELECT seq, added, removed, created_at AS createdAt FROM doc_versions WHERE doc_id = ? ORDER BY seq DESC')
+    .bind(id)
+    .all();
+  return c.json({ versions: results ?? [] });
+});
+
+// 取单版密文（客户端解密后用于查看全文 / diff / 恢复）
+api.get('/docs/:id/versions/:seq', async (c) => {
+  const denied = await requireSession(c);
+  if (denied) return denied;
+  const id = c.req.param('id');
+  const seq = Number(c.req.param('seq'));
+  if (id.length > 64 || !Number.isInteger(seq) || seq < 1) return c.json({ error: 'bad_request' }, 400);
+  const row = await c.env.DB
+    .prepare('SELECT cipher, nonce FROM doc_versions WHERE doc_id = ? AND seq = ?')
+    .bind(id, seq)
+    .first<{ cipher: string; nonce: string }>();
+  if (!row) return c.json({ error: 'not_found' }, 404);
+  return c.json(row);
 });
 
 const app = new Hono<{ Bindings: Env }>();

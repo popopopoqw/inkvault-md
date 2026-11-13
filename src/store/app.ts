@@ -10,6 +10,7 @@ import {
   holdKey,
   randomHex,
 } from '../lib/crypto';
+import { lineDiff, uploadVersion } from '../lib/history';
 import type { DecryptedDoc, EncryptedDoc } from '../lib/types';
 
 export type Phase = 'boot' | 'setup' | 'login' | 'ready';
@@ -33,18 +34,29 @@ interface AppState {
   expanded: Record<string, boolean>;
   saveState: SaveState;
   toast: string | null;
+  reveal: { path: string; lineNo: number } | null;
+  imageViewer: string | null;
+  focusDoc: string | null;
 
   boot: () => Promise<void>;
   setup: (password: string) => Promise<void>;
   login: (password: string) => Promise<void>;
   logout: () => Promise<void>;
+  openSearchHit: (path: string, lineNo: number) => void;
+  clearReveal: () => void;
+  openImageViewer: (src: string) => void;
+  closeImageViewer: () => void;
+  requestFocus: (docId: string) => void;
+  clearFocusRequest: () => void;
   selectDoc: (id: string) => void;
   toggleFolder: (id: string) => void;
   createNode: (parentId: string | null, isFolder: boolean, initialContent?: string) => Promise<void>;
+  createNodeNamed: (parentId: string | null, isFolder: boolean, name: string) => Promise<void>;
   renameNode: (id: string, title: string) => Promise<void>;
   moveNode: (id: string, parentId: string | null, sortKey: number) => Promise<void>;
   deleteNode: (id: string) => Promise<void>;
   updateContent: (id: string, content: string) => void;
+  applyRestoredContent: (id: string, content: string) => void;
   flush: () => Promise<void>;
   showToast: (msg: string) => void;
   dismissToast: () => void;
@@ -56,6 +68,47 @@ let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let authInfo: AuthInfo = { initialized: false };
 let flushing = false;
 let flushQueued = false;
+
+// ---- 历史快照节流（同文档 10 分钟内不重复快照；内容不变不重复） ----
+const SNAPSHOT_MIN_INTERVAL_MS = 10 * 60 * 1000;
+const pendingSnapshots = new Map<string, string>(); // docId → 被覆盖前的旧内容
+const lastSnapshotAt = new Map<string, number>();
+const lastSnapshotContent = new Map<string, string>();
+
+function resetSnapshotState() {
+  pendingSnapshots.clear();
+  lastSnapshotAt.clear();
+  lastSnapshotContent.clear();
+}
+
+function maybeQueueSnapshot(id: string, oldContent: string) {
+  if (!oldContent.trim()) return; // 空文档不入历史
+  const last = lastSnapshotAt.get(id) ?? 0;
+  if (Date.now() - last < SNAPSHOT_MIN_INTERVAL_MS) return;
+  if (lastSnapshotContent.get(id) === oldContent) return; // 与上次快照相同
+  pendingSnapshots.set(id, oldContent);
+}
+
+// flush 成功后把积压的旧内容快照逐个加密上传（失败静默，不影响主保存流程）
+async function flushSnapshots() {
+  if (!pendingSnapshots.size) return;
+  const entries = [...pendingSnapshots];
+  pendingSnapshots.clear();
+  for (const [id, content] of entries) {
+    const doc = useStore.getState().docs[id];
+    if (!doc) continue; // 文档已删除（服务端已级联清理其历史）
+    try {
+      const prevSnap = lastSnapshotContent.get(id);
+      // 首个快照即"初始版本"，统计 0/0（与桌面版语义一致）
+      const stat = prevSnap == null ? { added: 0, removed: 0 } : lineDiff(prevSnap.split('\n'), content.split('\n'));
+      await uploadVersion(id, doc.title, content, stat.added, stat.removed);
+      lastSnapshotAt.set(id, Date.now());
+      lastSnapshotContent.set(id, content);
+    } catch {
+      /* 快照失败下次内容变化会再触发 */
+    }
+  }
+}
 
 export function childrenOf(docs: Record<string, DecryptedDoc>, parentId: string | null): DecryptedDoc[] {
   return Object.values(docs)
@@ -139,6 +192,9 @@ export const useStore = create<AppState>()((set, get) => ({
   expanded: {},
   saveState: 'idle',
   toast: null,
+  reveal: null,
+  imageViewer: null,
+  focusDoc: null,
 
   showToast: (msg) => {
     set({ toast: msg });
@@ -206,16 +262,36 @@ export const useStore = create<AppState>()((set, get) => ({
     }
     dirty.clear();
     pendingDeletes.clear();
+    resetSnapshotState();
     dropKey();
     setSessionToken(null);
     set({ phase: 'login', docs: {}, activeId: null, expanded: {}, saveState: 'idle' });
   },
 
-  selectDoc: (id) => set({ activeId: id }),
+  // 从搜索结果跳转：打开文档并把光标定位到目标行（EditorPane 消费后清空）
+  openSearchHit: (path, lineNo) => {
+    void get().flush();
+    set({ activeId: path, reveal: { path, lineNo } });
+  },
+
+  clearReveal: () => set({ reveal: null }),
+
+  openImageViewer: (src) => set({ imageViewer: src }),
+  closeImageViewer: () => set({ imageViewer: null }),
+
+  requestFocus: (docId) => set({ focusDoc: docId }),
+  clearFocusRequest: () => set({ focusDoc: null }),
+
+  selectDoc: (id) => {
+    // 切换文档前把未保存的内容先上传，防止防抖窗口内切换导致丢失
+    void get().flush();
+    set({ activeId: id });
+  },
 
   toggleFolder: (id) => set((s) => ({ expanded: { ...s.expanded, [id]: !s.expanded[id] } })),
 
   createNode: async (parentId, isFolder, initialContent) => {
+    await get().flush(); // 先保存当前文档，防抖窗口内新建会丢内容
     const { docs } = get();
     const id = randomHex(16);
     const sortKey = sortKeyBetween(docs, parentId, null, null);
@@ -232,6 +308,32 @@ export const useStore = create<AppState>()((set, get) => ({
       docs: { ...s.docs, [id]: node },
       activeId: isFolder ? s.activeId : id,
       expanded: parentId ? { ...s.expanded, [parentId]: true } : s.expanded,
+      focusDoc: isFolder ? null : id,
+    }));
+    dirty.add(id);
+    await get().flush();
+  },
+
+  // 新建对话框提交：带名字创建（网页端名称仅前端校验，同名不冲突）
+  createNodeNamed: async (parentId, isFolder, name) => {
+    await get().flush();
+    const { docs } = get();
+    const id = randomHex(16);
+    const sortKey = sortKeyBetween(docs, parentId, null, null);
+    const node: DecryptedDoc = {
+      id,
+      parentId,
+      isFolder,
+      sortKey,
+      version: 0,
+      title: name,
+      content: '',
+    };
+    set((s) => ({
+      docs: { ...s.docs, [id]: node },
+      activeId: isFolder ? s.activeId : id,
+      expanded: parentId ? { ...s.expanded, [parentId]: true } : s.expanded,
+      focusDoc: isFolder ? null : id,
     }));
     dirty.add(id);
     await get().flush();
@@ -283,9 +385,19 @@ export const useStore = create<AppState>()((set, get) => ({
   updateContent: (id, content) => {
     const doc = get().docs[id];
     if (!doc || doc.content === content) return;
+    maybeQueueSnapshot(id, doc.content); // 内容被覆盖前捕获旧值入快照队列
     set((s) => ({ docs: { ...s.docs, [id]: { ...doc, content } } }));
     dirty.add(id);
     scheduleAutosave();
+  },
+
+  // 恢复历史版本：用历史内容替换内存并立即加密上传（服务端只存当前版，恢复即新当前版）
+  applyRestoredContent: (id, content) => {
+    const doc = get().docs[id];
+    if (!doc || doc.content === content) return;
+    set((s) => ({ docs: { ...s.docs, [id]: { ...doc, content } } }));
+    dirty.add(id);
+    void get().flush();
   },
 
   flush: async () => {
@@ -322,6 +434,7 @@ export const useStore = create<AppState>()((set, get) => ({
       const res = await api<{ docs: EncryptedDoc[] }>('/docs/sync', { method: 'POST', body: { upserts, deletes } });
       dirty.clear();
       pendingDeletes.clear();
+      void flushSnapshots(); // 保存成功后上传积压的历史快照
       // 正常保存：仅回填服务端版本号，本地明文就是最新
       set((s) => {
         const versionById = new Map(res.docs.map((r) => [r.id, r.version]));
@@ -374,10 +487,13 @@ function errorMessage(e: unknown): string {
 setUnauthorizedHandler(() => {
   dirty.clear();
   pendingDeletes.clear();
+  resetSnapshotState();
   dropKey();
   setSessionToken(null);
   useStore.setState({ phase: 'login', docs: {}, activeId: null, saveState: 'idle' });
 });
+
+export const useStoreReveal = () => useStore((s) => s.reveal);
 
 const WELCOME_CONTENT = `# 欢迎使用 Markdown 编辑器
 

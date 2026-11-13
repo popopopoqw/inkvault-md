@@ -1,6 +1,8 @@
 import { useDeferredValue, useEffect, useMemo } from 'react';
 import { renderMarkdown } from '../lib/markdown';
 import { resolveAssetUrl } from '../lib/assets';
+import { renderMermaidToSvg } from '../lib/mermaid';
+import { useStore } from '../store/app';
 import type { HeadingInfo } from '../lib/markdown';
 
 export function Preview({
@@ -31,6 +33,18 @@ export function Preview({
           img.alt = `${img.alt || '图片'}（加载失败）`;
         });
     });
+    // 流程图：mermaid 块异步渲染成 SVG
+    el.querySelectorAll<HTMLElement>('.mermaid-block').forEach((block) => {
+      const code = block.textContent ?? '';
+      void renderMermaidToSvg(code)
+        .then((svg) => {
+          block.innerHTML = svg;
+        })
+        .catch((e) => {
+          block.classList.add('mermaid-error');
+          block.textContent = `图表渲染失败：${(e as Error)?.message?.split('\n')[0] ?? '语法错误'}`;
+        });
+    });
   }, [result.html, scrollRef]);
 
   // 纯预览模式下，随滚动高亮当前所在标题（按索引与源码大纲对齐）
@@ -57,7 +71,16 @@ export function Preview({
   }, [scrollRef, onHeadingIndexChange, result.html]);
 
   return (
-    <div className="preview-scroll" ref={scrollRef as React.Ref<HTMLDivElement>}>
+    <div
+      className="preview-scroll"
+      ref={scrollRef as React.Ref<HTMLDivElement>}
+      onDoubleClick={(e) => {
+        const img = (e.target as HTMLElement).closest?.('img');
+        if (img && !(img as HTMLImageElement).src.startsWith('data:')) {
+          useStore.getState().openImageViewer((img as HTMLImageElement).src);
+        }
+      }}
+    >
       <div className="markdown-body" dangerouslySetInnerHTML={{ __html: result.html }} />
     </div>
   );

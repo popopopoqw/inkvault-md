@@ -77,6 +77,28 @@ export const IconEye = (p: SVGProps<SVGSVGElement>) => (
   </Icon>
 );
 
+export const IconClock = (p: SVGProps<SVGSVGElement>) => (
+  <Icon {...p}>
+    <circle cx="12" cy="12" r="9" />
+    <path d="M12 7v5l3.5 2" />
+  </Icon>
+);
+
+export const IconSearch = (p: SVGProps<SVGSVGElement>) => (
+  <Icon {...p}>
+    <circle cx="11" cy="11" r="7" />
+    <path d="m20 20-3.8-3.8" />
+  </Icon>
+);
+
+export const IconHistory = (p: SVGProps<SVGSVGElement>) => (
+  <Icon {...p}>
+    <path d="M3 12a9 9 0 1 0 3-6.7" />
+    <path d="M3 4v4h4" />
+    <path d="M12 7v5l3.5 2" />
+  </Icon>
+);
+
 export const IconLogout = (p: SVGProps<SVGSVGElement>) => (
   <Icon {...p}>
     <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
