@@ -520,6 +520,11 @@ setUnauthorizedHandler(() => {
 
 export const useStoreReveal = () => useStore((s) => s.reveal);
 
+// 调试与自动化测试辅助（只读访问 store 状态）
+if (typeof window !== 'undefined') {
+  (window as unknown as { __store?: typeof useStore }).__store = useStore;
+}
+
 const WELCOME_CONTENT = `# 欢迎使用 Markdown 编辑器
 
 所有内容在**浏览器内加密**后才上传，服务器只保存密文。
