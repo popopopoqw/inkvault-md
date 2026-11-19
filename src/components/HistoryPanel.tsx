@@ -25,6 +25,7 @@ export function HistoryPanel({ docId, onClose }: { docId: string; onClose: () =>
   const [versions, setVersions] = useState<VersionInfo[] | null>(null);
   const [selected, setSelected] = useState<VersionInfo | null>(null);
   const [diff, setDiff] = useState<DiffLine[] | null>(null);
+  const [diffError, setDiffError] = useState<string | null>(null);
   const [fullText, setFullText] = useState<string | null>(null);
   const [showFull, setShowFull] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -42,10 +43,16 @@ export function HistoryPanel({ docId, onClose }: { docId: string; onClose: () =>
   useEffect(() => {
     if (!selected) return;
     setDiff(null);
+    setDiffError(null);
     setFullText(null);
     setShowFull(false);
     if (selected.is_full) return;
-    void readVersionDiff(docId, selected.seq).then(setDiff).catch(() => setDiff([]));
+    void readVersionDiff(docId, selected.seq)
+      .then((d) => setDiff(d))
+      .catch((e) => {
+        setDiff([]);
+        setDiffError((e as Error)?.message ?? '加载变更失败');
+      });
   }, [docId, selected]);
 
   useEffect(() => {
@@ -74,8 +81,9 @@ export function HistoryPanel({ docId, onClose }: { docId: string; onClose: () =>
     setBusy(true);
     try {
       const doc = useStore.getState().docs[docId];
-      const content = await restoreVersion(docId, doc?.title ?? '', doc?.content ?? '', selected.seq);
+      const { content, snapshotted } = await restoreVersion(docId, doc?.title ?? '', doc?.content ?? '', selected.seq);
       useStore.getState().applyRestoredContent(docId, content);
+      useStore.getState().syncSnapshotAfterRestore(docId, snapshotted);
       useStore.getState().showToast('已恢复，当前编辑内容已存入历史');
       const v = await listVersions(docId);
       setVersions(v);
@@ -138,7 +146,7 @@ export function HistoryPanel({ docId, onClose }: { docId: string; onClose: () =>
                   ) : diff === null ? (
                     <p className="toc-empty">加载变更…</p>
                   ) : diff.length === 0 ? (
-                    <p className="toc-empty">该版本无行级变更</p>
+                    <p className="toc-empty">{diffError ?? '该版本无行级变更'}</p>
                   ) : (
                     <div className="history-diff">
                       {diff.map((l, i) => (

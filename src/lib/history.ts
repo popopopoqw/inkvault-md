@@ -96,6 +96,18 @@ export async function uploadVersion(docId: string, title: string, content: strin
   await api(`/docs/${docId}/versions`, { method: 'POST', body: { cipher, nonce, added, removed } });
 }
 
+/**
+ * 取该文档在服务端的最新快照明文（无快照时 null）。
+ * 快照基准（上一版内容）只存内存，刷新/重登即丢——此时用它重建基准，
+ * 避免统计错位（+0 −0）和重复上传内容相同的版本。
+ */
+export async function fetchLatestSnapshotContent(docId: string): Promise<string | null> {
+  const { versions } = await api<{ versions: VersionRow[] }>(`/docs/${docId}/versions`);
+  const latest = versions?.[0];
+  if (!latest) return null;
+  return readVersion(docId, latest.seq);
+}
+
 // ---- HistoryPanel 需要的四个操作 ----
 
 /** 版本元数据列表（升序，末位最新；与桌面版返回顺序一致） */
@@ -124,18 +136,33 @@ export async function readVersion(docId: string, seq: number): Promise<string> {
 /** 该版相对前一版的行级 diff（seq=1 无前版，返回空） */
 export async function readVersionDiff(docId: string, seq: number): Promise<DiffLine[]> {
   if (seq <= 1) return [];
-  const [prev, cur] = await Promise.all([readVersion(docId, seq - 1), readVersion(docId, seq)]);
-  return lineDiff(prev.split('\n'), cur.split('\n')).lines;
+  try {
+    const [prev, cur] = await Promise.all([readVersion(docId, seq - 1), readVersion(docId, seq)]);
+    return lineDiff(prev.split('\n'), cur.split('\n')).lines;
+  } catch (e) {
+    // 前一版已被保留上限清理：明确告知而不是伪装成"无变更"
+    const status = (e as { status?: number })?.status;
+    if (status === 404) throw new Error('上一版本已被清理，无法对比');
+    throw e;
+  }
 }
 
 /**
  * 恢复历史版本：先把当前内容强制存一版（可撤销），再返回历史明文。
+ * 返回 snapshotted = 本次强制存档的内容（未存档时为 null），调用方需同步节流记录，
+ * 否则恢复后 10 分钟的编辑会把与历史中完全相同的内容再存一版（重复版本）。
  * 上传新当前版由调用方走 applyRestoredContent → flush 完成。
  */
-export async function restoreVersion(docId: string, title: string, currentContent: string, seq: number): Promise<string> {
+export async function restoreVersion(
+  docId: string,
+  title: string,
+  currentContent: string,
+  seq: number
+): Promise<{ content: string; snapshotted: string | null }> {
   const key = currentKey();
   if (!key) throw new Error('未解锁');
   const target = await readVersion(docId, seq);
+  let snapshotted: string | null = null;
   if (currentContent.trim() && currentContent !== target) {
     // 与最新一版比对得出统计（不追求精确，仅列表展示）
     const { versions } = await api<{ versions: VersionRow[] }>(`/docs/${docId}/versions`);
@@ -151,6 +178,7 @@ export async function restoreVersion(docId: string, title: string, currentConten
       added = currentContent.split('\n').length;
     }
     await uploadVersion(docId, title, currentContent, added, removed);
+    snapshotted = currentContent;
   }
-  return target;
+  return { content: target, snapshotted };
 }

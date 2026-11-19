@@ -10,7 +10,7 @@ import {
   holdKey,
   randomHex,
 } from '../lib/crypto';
-import { lineDiff, uploadVersion } from '../lib/history';
+import { fetchLatestSnapshotContent, lineDiff, uploadVersion } from '../lib/history';
 import type { DecryptedDoc, EncryptedDoc } from '../lib/types';
 
 export type Phase = 'boot' | 'setup' | 'login' | 'ready';
@@ -57,6 +57,7 @@ interface AppState {
   deleteNode: (id: string) => Promise<void>;
   updateContent: (id: string, content: string) => void;
   applyRestoredContent: (id: string, content: string) => void;
+  syncSnapshotAfterRestore: (id: string, snapshotted: string | null) => void;
   flush: () => Promise<void>;
   showToast: (msg: string) => void;
   dismissToast: () => void;
@@ -86,7 +87,9 @@ function maybeQueueSnapshot(id: string, oldContent: string) {
   const last = lastSnapshotAt.get(id) ?? 0;
   if (Date.now() - last < SNAPSHOT_MIN_INTERVAL_MS) return;
   if (lastSnapshotContent.get(id) === oldContent) return; // 与上次快照相同
-  pendingSnapshots.set(id, oldContent);
+  // 只记录本周期第一次编辑前的内容：连续打字时后续中间态不覆盖，
+  // 否则最终上传的快照≈当前内容，真正的旧版本会永久丢失
+  if (!pendingSnapshots.has(id)) pendingSnapshots.set(id, oldContent);
 }
 
 // flush 成功后把积压的旧内容快照逐个加密上传（失败静默，不影响主保存流程）
@@ -98,8 +101,23 @@ async function flushSnapshots() {
     const doc = useStore.getState().docs[id];
     if (!doc) continue; // 文档已删除（服务端已级联清理其历史）
     try {
-      const prevSnap = lastSnapshotContent.get(id);
-      // 首个快照即"初始版本"，统计 0/0（与桌面版语义一致）
+      // 快照基准（上一版内容）只在内存：刷新/重登后为空，从服务端最新快照重建，
+      // 否则统计错位（恒为 +0 −0）且可能与已有版本内容重复
+      let prevSnap: string | null | undefined = lastSnapshotContent.get(id);
+      if (prevSnap == null) {
+        try {
+          prevSnap = await fetchLatestSnapshotContent(id);
+        } catch {
+          prevSnap = null; // 拉取失败按无基准处理
+        }
+      }
+      if (prevSnap === content) {
+        // 内容与服务端最新快照相同（本会话未产生真实变更），不重复入史
+        lastSnapshotAt.set(id, Date.now());
+        lastSnapshotContent.set(id, content);
+        continue;
+      }
+      // 真正的首个快照即"初始版本"，统计 0/0（与桌面版语义一致）
       const stat = prevSnap == null ? { added: 0, removed: 0 } : lineDiff(prevSnap.split('\n'), content.split('\n'));
       await uploadVersion(id, doc.title, content, stat.added, stat.removed);
       lastSnapshotAt.set(id, Date.now());
@@ -398,6 +416,13 @@ export const useStore = create<AppState>()((set, get) => ({
     set((s) => ({ docs: { ...s.docs, [id]: { ...doc, content } } }));
     dirty.add(id);
     void get().flush();
+  },
+
+  // 恢复流程在 lib/history 里强制存了一版当前内容（绕过了这里的管理），
+  // 回写节流记录：重置 10 分钟计时并登记快照内容，避免恢复后把相同内容再存一版
+  syncSnapshotAfterRestore: (id, snapshotted) => {
+    lastSnapshotAt.set(id, Date.now());
+    if (snapshotted != null) lastSnapshotContent.set(id, snapshotted);
   },
 
   flush: async () => {
